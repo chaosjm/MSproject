@@ -1,0 +1,1041 @@
+---
+title: "MSfinal"
+author: "Yael Scharf"
+date: '2022-06-10'
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(caret)
+library(tidymodels)
+library(vip)
+library(dplyr)
+library(mlbench)
+library(tidyverse)  # data manipulation
+library(cluster)    # clustering algorithms kmeans
+library(factoextra)  # clustering algorithms & visualization kmeans
+library(Rtsne)       # t-SNE methodology
+library(kernlab)     # SVM methodology
+library(adabag)      # Adaboost methodology
+```
+
+## Introduction
+
+Multiple sclerosis (MS) is an autoimmune condition that can affect the brain and spinal cord, causing a wide range of symptoms, such as problems with vision and arm or leg movement, sensation, or balance. MS is a lifelong condition, mainly diagnosed in people in their 20s, 30s, and 40s, and is 2-3 times more common in women than in men. Although MS is rarely fatal, the average life expectancy for people with MS is around 5 to 10 years lower than average, and this gap appears to be getting smaller all the time.
+Biologically, in MS, the immune system mistakenly attacks the healthy parts of the body: the brain or spinal cord of the nervous system, mainly the layer that surrounds and protects the nerves called the myelin sheath. Hence, messages traveling along the nerves become slower or disrupted. The causes of the behavior described above are unclear, but most experts think a combination of genetic and environmental factors is involved. There's currently no cure for MS, but several treatments can help control the condition and ease symptoms to improve the quality of life of people with this condition. (For more information on MS: https://www.nhs.uk/conditions/multiple-sclerosis/)
+Most of the studies of MS center on the immune system, but Fitzgerald et al. 2021 decided to take a different approach by studying the metabolome of people with MS. In this report, we will analyze this unique research’s data set with the aim of finding new correlations using four classifier models: K-Nearest Neighbors (KNN), K-means, random forest and Support Vector Machine (SVM); and the feature reduction model T-distributed Stochastic Neighbor Embedding (t-SNE).
+This report will be based on the Fitzgerald et al. 2021 data set (supplementary information):
+```{r}
+# Reading the data
+ms_dat <- read.delim("/Users/yaelscharf/Downloads/metab_data_template_final.csv", header = TRUE, sep=",")
+str(ms_dat)
+```
+Since the data is clean from NA's and missing values, we can look closer at the data. The data shows that the people that participated in the research are mainly categorized according to status: Multiple Sclerosis (MS) and Healthy Control (HC), gender and race. Furthermore, each metabolite is marked with an X and a serial number. 
+For further analysis, we’ll need more information on the distribution of these categories. Hence, we’ll turn these categories to factors.
+
+```{r}
+cols <- c("status", "gender", "race")
+ms_dat[cols] <- lapply(ms_dat[cols], factor)
+summary(ms_dat[cols])
+```
+
+The summary above indicates that approximately 2/3 of the participants are with MS; 70% of them are female and 80% of white ethnicity. This leads to the question whether there is any connection between these different factors to the levels of metabolites, and if so, how. In order to answer this question, we need to check how each of the factors correlate with the data.
+
+## EDA
+
+Note: In lecture the images had mistakes because of errors only much later found in the code. In this section are the correct results.
+By the order of the data, we'll start with status of health(MS or HC).  
+```{r}
+# Random forest requires setting a seed
+set.seed(123)
+ms_split <- initial_split(ms_dat %>% dplyr::select(-c(record_id, batch)), 
+                            strata = status)
+ms_train_stat <- training(ms_split)
+ms_test_stat  <- testing(ms_split)
+
+# Checking the results of the split
+nrow(ms_train_stat)
+nrow(ms_train_stat)/nrow(ms_split)
+
+# Training set proportions by status of health
+ms_train_stat %>% 
+  count(status) %>% 
+  mutate(prop = n/sum(n))
+
+# Testing set proportions by status of health
+ms_test_stat %>% 
+  count(status) %>% 
+  mutate(prop = n/sum(n))
+```
+
+Seeing that the proportions of the training and test sets are more or less similar to the data set, the next step will be to define the number of trees in the random forest model, 1000, and the engine "ranger":
+
+```{r}
+# Creating random forest model
+rf_mod_stat <- 
+  rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>%  
+  set_mode("classification")
+```
+
+With a defined model, we can start the training step with new seed for reproducible results:
+
+```{r}
+# Training the model
+set.seed(345)
+rf_fit_stat <- 
+  rf_mod_stat %>% 
+  fit(status ~ ., data = ms_train_stat)
+rf_fit_stat
+```
+
+It seems that the requirements and execution of our model were met with a low rate of prediction error, 0.18. Hence, we'll test the trade-off between the sensitivity and specificity and the classification accuracy using the Receiver Operating Characteristic (ROC).
+
+```{r}
+# Calculating our model's prediction abilities
+rf_training_stat_pred <- 
+  predict(rf_fit_stat, ms_train_stat) %>% 
+  bind_cols(predict(rf_fit_stat, ms_train_stat, type = "prob")) %>% 
+  bind_cols(ms_train_stat %>% dplyr::select(status))
+
+# ROC calculation
+rf_training_stat_pred %>%               
+  roc_auc(truth = status, .pred_MS)
+
+# Accuracy calculation
+rf_training_stat_pred %>%               
+  accuracy(truth = status, .pred_class)
+```
+
+Although the accuracy is high (1!), the ROC estimate is quite low (0!). Let's check what happens when we perform the same analysis on the test data:
+
+```{r}
+rf_testing_stat_pred <- 
+  predict(rf_fit_stat, ms_test_stat) %>% 
+  bind_cols(predict(rf_fit_stat, ms_test_stat, type = "prob")) %>% 
+  bind_cols(ms_test_stat %>% dplyr::select(status))
+
+# ROC calculation
+rf_testing_stat_pred %>%               
+  roc_auc(truth = status, .pred_MS)
+
+# Accuracy calculation
+rf_testing_stat_pred %>%               
+  accuracy(truth = status, .pred_class)
+```
+
+These results of the test set seem more realistic. The ROC is still quite low (0.28), but the accuracy is more realistic than the value of 1 (0.72). However, both of the values indicate that the model is not good yet. Hence, using 10-fold cross validation re-sampling we'll try to improve it:   
+```{r}
+# Creating 10 mini data sets from the training data
+set.seed(456)
+folds <- vfold_cv(ms_train_stat, v = 10)
+folds
+
+# Setting the random forest workflow that bundles together the model specifications and actual modeling
+rf_stat_wf <- 
+  workflow() %>%
+  add_model(rf_mod_stat) %>%
+  add_formula(status ~ .)
+
+# Add folds to workflow and train model
+set.seed(567)
+rf_fit_stat_rs <- 
+  rf_stat_wf %>% 
+  fit_resamples(folds)
+
+rf_fit_stat_rs
+
+collect_metrics(rf_fit_stat_rs)
+```
+
+The re-sampling improved the ROC estimate significantly (0.79), while still maintaining the low value previously observed in the testing of the accuracy estimates is maintained (0.73). To understand which of all the estimates previously observed reflects our data set the most, we need to make predictions of these estimates:
+
+```{r}
+# ROC calculation
+rf_testing_stat_pred %>%               
+  roc_auc(truth = status, .pred_MS)
+
+# Accuracy calculation
+rf_testing_stat_pred %>%               
+  accuracy(truth = status, .pred_class)
+```
+
+The estimates remain unchanged from the data set, indicating that the current model still does not classify well (accuracy 0f ~0.7 and ROC of 0.28). Tuning may solve that by using one decision tree that is more sensitive to parameters that random forest isn't.
+
+```{r}
+# Defining the parameters for the decision tree
+tune_stat <- 
+  decision_tree(
+    cost_complexity = tune(), 
+    tree_depth = tune()
+  ) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+tune_stat
+
+# Creating 5 'datasets' with different combinations
+tree_grid <- grid_regular(cost_complexity(), 
+                          tree_depth(),
+                          levels = 5)
+
+tree_grid
+
+tree_grid %>% 
+  count(tree_depth)
+
+set.seed(678)
+ms_folds_stat <- vfold_cv(ms_train_stat) # create the actual cross-validation folds
+```
+
+Now let's add the grid to this model:
+
+```{r}
+set.seed(789)
+# Defining workflow
+tree_stat_wf <-workflow() %>%
+  add_model(tune_stat) %>%
+  add_formula(status ~ .)
+
+# Updating and training workflow with grids
+tree_stat_res <- 
+  tree_stat_wf %>% 
+  tune_grid(
+    resamples = ms_folds_stat,
+    grid = tree_grid
+    )
+
+tree_stat_res
+
+tree_stat_res %>% 
+  collect_metrics()
+```
+
+Despite the Tuning, the model is still not good. Although the ROC estimate has risen (0.5), the accuracy is even lower than before (~0.66).  In order to understand what happened in the process that led to this result, we’ll plot the performance:
+
+```{r}
+# plot performance
+tree_stat_res  %>%
+  collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>%
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+The accuracy was the best when the decision tree was of depth 4, and accordingly the cost complexity is high. Let's use the show_best() function to see the top 5 candidate models by default:
+
+```{r}
+# best tree
+tree_stat_res %>%
+  show_best("roc_auc")
+```
+
+The first 4 best models are of depth 4 and one of 8. But which is the best? Workflow can determine that as follows:  
+
+```{r}
+best_tree <- tree_stat_res %>%
+  select_best("roc_auc") # Selecting the best tree
+
+best_tree
+
+# Finalize workflow
+final_wf <- 
+  tree_stat_wf %>% 
+  finalize_workflow(best_tree)
+
+final_wf
+```
+
+Now that we found the best tree, let's look who is this tree:
+
+```{r}
+final_tree <- 
+  final_wf %>%
+  fit(data = ms_train_stat) 
+
+final_tree
+```
+
+The feature that impacted on the status of disease classification we can use the vip package as follows:
+
+```{r}
+final_tree %>% 
+  pull_workflow_fit() %>% 
+  vip()
+```
+
+The graph indicates that the main features affecting the classification in our model are (in descending order):
+1. Phenyllactate (PLA), a part of phenylalanine catabolism, mainly associated with the Mendelian disease phenylketonuria (PKU). 
+2. Indolelactate, a tryptophan metabolite (that was previously associated with MS, levi et al. 2021). 
+3. 3-(4-hydroxyphenyl)lactate, a tyrosine metabolite. 
+4. 2-hydroxy-3-methylvalerate, an organic acid generated by L-isoleucine metabolism, associated with Maple Syrup Urine Disease (MSUD).
+5. Asparagine, an amino acid.
+6. Alpha-hydroxyisocaproate, an end product of leucine metabolism.
+7. Imidazole lactate, a component of a normal human urine.
+8. Acetylcarnitine, the shortest form of acylcarnitine that participates in brain metabolism due to likely transport across the blood–brain barrier.
+9. Histidine, an amino acid.
+10. Methionine, an amino acid.
+These results are interesting biological wise. However, we need to check the trade off between sensitivity and specificity to understand the validity of the model. For this purpose, we'll plot the ROC curve:  
+
+```{r}
+# Set workflow
+final_fit_stat <- 
+  final_wf %>%
+  last_fit(ms_split) 
+
+# train
+final_fit_stat %>%
+  collect_metrics()
+
+# collect metrics
+final_fit_stat %>%
+  collect_predictions() %>% 
+  roc_curve(status, .pred_MS) %>% 
+  autoplot()
+
+args(decision_tree)
+```
+The ROC curves show that the model was more specific than sensitive in its classification process. This further strengthen the notion of the lack of validity of the classification of health status.
+To sum up this part, the classification model depending on the status of health didn’t show in the overall analysis any reliability in good classification. To further assert whether this is specific to the random forest or not, in this report I'll check the classification with random forest on the other factors and other classification algorithms. By that we can also see if the results above are reproducible and significant.
+
+## Summary
+
+In this report we demonstrate how by metabolic data and three known factors: status of health, gender and race using 4 classification models: K-Nearest Neighbors (KNN), K-means, random forest and Support Vector Machine (SVM); and the feature reduction model T-distributed Stochastic Neighbor Embedding (t-SNE). The best classification was achieved when classifying by gender model using the random forest algorithm, while the worst was with KNN for the status model. In the most affecting metabolite area, the results were not conclusive. The results of Fitzgerald et al 2021 showed, came in agreement with the classification of MS in the status of health in the random forest, which had about 70% accuracy. On the other hand, the best and the most valid classification model we had, random forest by gender, indicated on other amino acids precursors and hormones not specifically associated with aromatic amino acids metabolism.
+
+## Findings
+
+### The K-Nearest Neighbors (KNN) model
+
+The simplest model to perform, just to get a clear picture on the model is the KNN model. The first step in this model is to normalize the data. The min-max normalization strategy will suffice.
+
+```{r}
+# Normalization function
+normalize <- function(x) {
+num <- x - min(x)
+denom <- max(x) - min(x)
+return (num/denom)
+}
+
+# Normalizing the data 
+msnorm <- as.data.frame(lapply(ms_dat[7:275], normalize))
+```
+
+After normalization, we can perform the KNN algorithm using the caret package. First we'll choose the effect of the status of health:
+
+```{r}
+# Splitting the data with a novel index  
+index <- createDataPartition(ms_dat$status, p=0.8, list=FALSE)
+
+# Subset training set with the index 
+statmsnorm.training <- msnorm[index,]
+statms.training <- ms_dat[index,]
+
+# Subset test set with the index
+statmsnorm.test <- msnorm[-index,]
+statms.test <- ms_dat[-index,]
+
+# Train a model
+statmodel_knn <- train(statmsnorm.training[, 5:269], statms.training[,2], method='knn')
+
+statmodel_cart <- train(statmsnorm.training[, 5:269], statms.training[, 2], method='rpart2')
+```
+
+Prediction using the KNN model produces the following results:
+
+```{r}
+# Predict the labels of the test set
+predictions<-predict.train(object=statmodel_knn,statmsnorm.test[,5:269], type="raw")
+
+# Evaluate the predictions
+table(predictions)
+
+# Confusion matrix 
+confusionMatrix(predictions,statms.test[,2])
+```
+
+The accuracy of prediction in the status model is not good, 0.62. The sensitivity, specificity and the ability to predict false values (negative and positive) also indicate that the model's efficiency is low. Moreover, the detection parameters and prevalence are low (approximately 0.3-0.2). Changing the K (data not shown) didn't show any improvement in classification... But it can make sense since finding a person of MS randomly from many healthy individuals is not always accurate because the frequency of the disease is not high in the population. Hence, let's try the KNN model on the gender factor: 
+
+```{r}
+# Splitting the data with a novel index  
+index <- createDataPartition(ms_dat$gender, p=0.8, list=FALSE)
+
+# Subset training set with the index 
+genmsnorm.training <- msnorm[index,]
+genms.training <- ms_dat[index,]
+
+# Subset test set with the index
+genmsnorm.test <- msnorm[-index,]
+genms.test <- ms_dat[-index,]
+
+# Train a model
+genmodel_knn <- train(genmsnorm.training[, 5:269], genms.training[,4], method='knn')
+
+genmodel_cart <- train(genmsnorm.training[, 5:269], genms.training[, 4], method='rpart2')
+```
+
+Prediction using the KNN model produces the following results:
+
+```{r}
+# Predict the labels of the test set
+predictions<-predict.train(object=genmodel_knn,genmsnorm.test[,5:269], type="raw")
+
+# Evaluate the predictions
+table(predictions)
+
+# Confusion matrix 
+confusionMatrix(predictions,genms.test[,4])
+```
+
+In contrast to what was observed in the status classification model, the accuracy of prediction in the gender model is good, 0.8. The sensitivity, specificity and the ability to predict false values (negative and positive) show the model's efficiency is good as well as the detection prevalence. However, detection rate and prevalence are not so good (approximately 0.7). Changing the K  didn't show any improvement in classification (data not shown), what leads us to suggest that finding a female with MS among healthy women is more probable since the disease's frequency in females is much higher than in men. 
+Finally, classifying the model according to the race factor didn't work because of the imbalance between the white ethnicity and the rest. What leads us to the conclusion of this part that the only model that was efficient was the gender KNN model. However, it can be just in the KNN algorithm. We'll need to test these conclusions in additional models.
+
+### K-means
+
+K-means has some similarities to KNN, for example a fixed number for the analysis. In this analysis this parameter K specifies the desired number of clusters. Moreover the kmeans() function requires a data frame containing only numeric data in addition to K , Hence:
+
+```{r}
+ms_knum <- ms_dat[7:275]
+```
+
+Just as in KNN, kmeans is sensitive to the distribution of our data, so we'll use z-score standardization on our data.
+
+```{r}
+# Coerced back to data frame form using the as.data.frame() function.
+ms_dat_z <- as.data.frame(lapply(ms_knum, scale)) 
+```
+
+With that in hand, we need to determine the K value for it can't be too specific to be useful or too small resulting in heterogeneous groupings.  For this purpose, we will use an elbow plot to see what seems to be the best k and see how it goes.
+
+```{r}
+wssplot <- function(data, num_clusters=15, seed=1234){
+  wss <- (nrow(data)-1)*sum(apply(data,2,var))
+  for (i in 2:num_clusters){
+    set.seed(seed)
+    wss[i] <- sum(kmeans(data, centers=i)$withinss)}
+  plot(1:num_clusters, wss, type="b", xlab="Number of Clusters",
+       ylab="Within groups sum of squares")
+  wss
+}
+
+wssplot(ms_dat_z)
+```
+
+This elbow plot is not clear due to the fact that there isn't a clear "elbow".
+Let's start with k=3 with nstart parameter a value of 25 (25 configurations) and report the best one. 
+
+```{r}
+set.seed(2345)
+ms_clusters_3 <- kmeans(ms_dat_z, centers = 3, nstart = 25)
+ms_clusters_3
+```
+
+Most of the data is a lot of numbers that are hard to comprehend. We do see a very short distance between the clusters. Generally the size of each cluster is:
+
+```{r}
+ms_clusters_3$size
+```
+
+For more characteristics, we'll merge the kmeans prediction back to the data:
+
+```{r}
+ms_dat$cluster3 <- ms_clusters_3$cluster
+```
+
+When the first 5 individuals in the data are:
+
+```{r}
+ms_dat[1:5, c("cluster3", "status", "gender", "race")]
+```
+
+When the average age of each cluster:
+
+```{r}
+aggregate(data = ms_dat, age ~ cluster3, mean)
+```
+
+Which is in agreement with ages of onset of MS, mainly females (data not shown). Let's map those clusters: 
+
+```{r}
+fviz_cluster(ms_clusters_3, data = ms_knum)
+```
+
+The clusters are quit close to one another due to the many metabolites. Deeper more thorough research is required to characterize each cluster (what was done in the paper with PCA) because we can have a lot of information just from the outliers. However, maybe this density is an indication that we need to choose a bigger k, like k=4. Let's check that:
+
+```{r}
+set.seed(2345)
+ms_clusters_4 <- kmeans(ms_dat_z, centers = 4, nstart = 25)
+ms_clusters_4
+```
+
+This time the distance between the clusters is a bit larger, when the size of each cluster is:
+
+```{r}
+ms_clusters_4$size
+```
+
+For more characteristics, we'll merge the kmeans prediction back to the data:
+
+```{r}
+ms_dat$cluster4 <- ms_clusters_4$cluster
+```
+
+When the first 5 individuals in the data are:
+
+```{r}
+ms_dat[1:5, c("cluster4", "status", "gender", "race")]
+```
+
+When the average age of each cluster:
+
+```{r}
+aggregate(data = ms_dat, age ~ cluster4, mean)
+```
+
+Here the range of ages is broader 37-51, mainly females (data not shown). Let's map those clusters: 
+
+```{r}
+fviz_cluster(ms_clusters_4, data = ms_knum)
+```
+
+However, with a greater K the overlap is higher than the previous K, which is not good for classification because overlapping of clusters can lead to higher erroneous classification. Hence, with the kmeans the best k for our data is 3. The information within each cluster requires further investigation that are broader than the scope of this report. Moreover, dimensional reduction may help as was done with PCA as shown in Fitzgerald et al. 2021 or other methods as we'll exemplify in the section after the next. 
+
+### The Random Forest model
+
+One of the most stringent models for this kind of classification is the random forest. This algorithm chooses the best decision tree out of many possible decision trees. This model requires the pre-processing steps of setting seed, splitting the data, and creating training and test sets. Moreover, the model requires choosing one factor for testing correlation.  Perhaps using the random forest on the gender factor: male or female, will yield a better model. 
+
+```{r}
+# Random forest requires setting a seed
+set.seed(111)
+ms_split_gen <- initial_split(ms_dat %>% dplyr::select(-c(record_id, batch)), 
+                            strata = gender)
+ms_train_gen <- training(ms_split_gen) 
+ms_test_gen  <- testing(ms_split_gen)
+
+# Checking the results of the split
+nrow(ms_train_gen)
+nrow(ms_train_gen)/nrow(ms_split_gen)
+
+# Training set proportions by gender
+ms_train_gen %>% 
+  count(gender) %>% 
+  mutate(prop = n/sum(n))
+
+# Testing set proportions by gender
+ms_test_gen %>% 
+  count(gender) %>% 
+  mutate(prop = n/sum(n))
+```
+
+Seeing that the proportions of the training and test sets are more or less similar to the data set (reminder: females are about 70% of the participants in the research), the next step will be to define the number of trees in the random forest model, 1000, and the engine "ranger":
+
+```{r}
+# Creating random forest model
+rf_mod_gen <- 
+  rand_forest(trees = 1000) %>% 
+  set_engine("ranger") %>%  
+  set_mode("classification")
+```
+
+With a defined model, we can start the training step with new seed for reproducible results:
+
+```{r}
+# Training the model
+set.seed(222)
+rf_fit_gen <- 
+  rf_mod_gen %>% 
+  fit(gender ~ ., data = ms_train_gen)
+rf_fit_gen
+```
+
+According to ranger, the requirements and execution of our model were met with a low rate of prediction error, 0.12.  The next step will be to understand the trade-off between the sensitivity and specificity and the classification accuracy using the Receiver Operating Characteristic (ROC).
+
+```{r}
+# Calculating our model's prediction abilities
+rf_training_gen_pred <- 
+  predict(rf_fit_gen, ms_train_gen) %>% 
+  bind_cols(predict(rf_fit_gen, ms_train_gen, type = "prob")) %>% 
+  bind_cols(ms_train_gen %>% dplyr::select(gender))
+
+# ROC calculation
+rf_training_gen_pred %>%               
+  roc_auc(truth = gender, .pred_F)
+
+# Accuracy calculation
+rf_training_gen_pred %>%               
+  accuracy(truth = gender, .pred_class)
+```
+
+In contrast to what we observed in the random forest of status of health, in this model the accuracy is (1!) and the ROC estimate (1!) are very high, and may indicate on an over fitting. Is this maintained in the test set as well?
+
+```{r}
+rf_testing_gen_pred <- 
+  predict(rf_fit_gen, ms_test_gen) %>% 
+  bind_cols(predict(rf_fit_gen, ms_test_gen, type = "prob")) %>% 
+  bind_cols(ms_test_gen %>% dplyr::select(gender))
+
+# ROC calculation
+rf_testing_gen_pred %>%               
+  roc_auc(truth = gender, .pred_F)
+
+# Accuracy calculation
+rf_testing_gen_pred %>%               
+  accuracy(truth = gender, .pred_class)
+```
+
+In the test set the ROC (0.91) as well as the accuracy (0.83) are less in comparison to the training test, but great and more realistic. Is it because of the analysis or a real stable model? re-sampling with 10-fold cross-validation can help in that:
+
+```{r}
+# Creating 10 mini data sets from the training data
+set.seed(333)
+folds <- vfold_cv(ms_train_gen, v = 10)
+folds
+
+# Setting the random forest workflow that bundles together the model specifications and actual modeling
+rf_gen_wf <- 
+  workflow() %>%
+  add_model(rf_mod_gen) %>%
+  add_formula(gender ~ .)
+
+# add folds to workflow and train model
+set.seed(444)
+rf_fit_gen <- 
+  rf_gen_wf %>% 
+  fit_resamples(folds)
+
+rf_fit_gen
+
+collect_metrics(rf_fit_gen)
+```
+
+The re-sampling maintained the values of the ROC (0.84) and the accuracy (0.9) estimates. Or generally the estimates are:
+
+```{r}
+# ROC calculation
+rf_testing_gen_pred %>%               
+  roc_auc(truth = gender, .pred_F)
+
+# Accuracy calculation
+rf_testing_gen_pred %>%               
+  accuracy(truth = gender, .pred_class)
+```
+
+The predictions of the estimates indicate that this model does classifies very well (accuracy 0f 0.83 and ROC of 0.91), without over fitting. will tuning improve the model?
+
+```{r}
+# Defining the parameters for the decision tree
+tune_spec_gen <- 
+  decision_tree(
+    cost_complexity = tune(), 
+    tree_depth = tune()
+  ) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+
+tune_spec_gen
+
+# Creating 5 'datasets' with different combinations
+tree_grid <- grid_regular(cost_complexity(), 
+                          tree_depth(),
+                          levels = 5)
+
+tree_grid
+
+tree_grid %>% 
+  count(tree_depth)
+
+set.seed(555)
+ms_folds_gen <- vfold_cv(ms_train_gen) # create the actual cross-validation folds
+```
+
+Now let's add the grid to this model:
+
+```{r}
+set.seed(666)
+# Defining workflow
+tree_gen_wf <- workflow() %>%
+  add_model(tune_spec_gen) %>%
+  add_formula(gender ~ .)
+
+# Updating and training workflow with grids
+tree_res_gen <- 
+  tree_gen_wf %>% 
+  tune_grid(
+    resamples = ms_folds_gen,
+    grid = tree_grid
+    )
+
+tree_res_gen
+
+tree_res_gen %>% 
+  collect_metrics()
+```
+
+The Tuning has worsen our model: the ROC estimate (0.68) and the accuracy (0.79) decreased.  In order to understand what happened in the process that led to these estimates, we’ll plot the performance:
+
+```{r}
+# plot performance
+tree_res_gen %>%
+  collect_metrics() %>%
+  mutate(tree_depth = factor(tree_depth)) %>%
+  ggplot(aes(cost_complexity, mean, color = tree_depth)) +
+  geom_line(size = 1.5, alpha = 0.6) +
+  geom_point(size = 2) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10(labels = scales::label_number()) +
+  scale_color_viridis_d(option = "plasma", begin = .9, end = 0)
+```
+
+The accuracy was the best when the decision tree was of depth 4, while the cost complexity is higher from tree depth 8. Let's use the show_best() function to see the top 5 candidate models by default:
+
+```{r}
+# best tree
+tree_res_gen %>%
+  show_best("roc_auc")
+```
+
+The first 4 best models are of depth 8 and one of 11. But which is the best? Workflow can determine that as follows:  
+
+```{r}
+best_tree_gen <- tree_res_gen %>%
+  select_best("roc_auc") # Selecting the best tree
+
+best_tree_gen
+
+# Finalize workflow
+final_wf_gen <- 
+  tree_gen_wf %>% 
+  finalize_workflow(best_tree_gen)
+
+final_wf_gen
+```
+
+Now that we found the best tree, let's look who is this tree:
+
+```{r}
+final_tree_gen <- 
+  final_wf_gen %>%
+  fit(data = ms_train_gen) 
+
+final_tree_gen
+```
+
+When the feature that impacted on the gender classification the most is:
+
+```{r}
+final_tree_gen %>% 
+  pull_workflow_fit() %>% 
+  vip()
+```
+
+N-acetylcarnosine, used as eye drops in preventing cataract, and the age, which makes sense because the onset of the disease is around 20 and 40 years of age. Metabolom wise, the metabolites that affected the classification the most after those were (in descending order): Pyroglutamine amino acid; 3-hydroxylated C19 steroid hormones that are known to favor the development of masculine characteristics; two types of sterol lipids with a sulfate group (37202 and 37211); Epiandrosterone sulfate, a sulfated steroid; and creatinine, a product of breaking of creatine phosphate from muscle and protein metabolism. The last two influence is the race and the derivative of the amino acid cysteine S-allylcysteine. Interestingly, the status and gender classification models don't classify by the same parameters which makes it harder to decide which has greater influence. However, the significance of the latter seems higher. Let's check the trade-off between the sensitivity and specificity in this model was according to the ROC curve in order to establish the validity of the gender model:
+
+```{r}
+# Set workflow
+final_fit_gen <- 
+  final_wf_gen %>%
+  last_fit(ms_split_gen) 
+
+# train
+final_fit_gen %>%
+  collect_metrics()
+
+# collect metrics
+final_fit_gen %>%
+  collect_predictions() %>% 
+  roc_curve(gender, .pred_F) %>% 
+  autoplot()
+
+args(decision_tree)
+```
+In contrast to the status classification model, the ROC curves show that in this model the sensitivity was higher than the specificity. Meaning, the gender classifier model performed much better than the status one. However, the differences between the results of the models of the most important features in the classification of the models raises the question which is the most important in MS. If we the race factor wasn’t skewed towards white ethnicity, we could have compared it to its classification model. But   in these cases the random forest isn’t as effective as always, what leads us to refer to the more reliable model of the two, the gender model. To sum up this part, the classification model depending on the status of health didn’t show in the overall analysis any reliability in good classification. Hence, there is great significance to its results. 
+In conclusion, despite the inconsistency in the results of the random forest models, at least the gender model is more robust and useful for classification that is independent from our data set. The gender classification model was better than the health status one, as the ROC curve showed. What proves once more that the random forest is one of the strongest and robust classification algorithms in most cases. In both factor the initial model before tuning and cross reference had the best accuracy. What leads us to suggest that using the initial model is the best one to use for future classification of similar data. 
+Let’s try another classification model in order to ascertain whether there is consistency with the results the gender model showed.
+
+### T-distributed Stochastic Neighbor Embedding (t-SNE)
+
+In the random forest model, one of the more robust and stringent classification model, the results still require improvement, at least in some factors. A dimensional reduction could help in raising the classification accuracy by modeling similar objects as nearby points and dissimilar objects as distant points. t-SNE, as a nonlinear dimension reduction technique, can be well-suited for our data since it can visualize a large amount of data with well-separated clusters.
+For this purpose, we'll have to arrange our data a bit differently:
+
+```{r}
+# Numbering our rows and removing the record id in a different variable than the original data
+ms_dat_mut <- ms_dat
+
+ms_dat_mut <- ms_dat_mut %>% 
+  select(-record_id)%>%
+  mutate(ID=row_number())
+
+# Selecting the classifying factors 
+ms_meta <- ms_dat_mut %>%
+  select(ID, status, gender, race)
+```
+
+In addition, t-SNE requires the selection of the numerical columns as well as standardization of the data, and only then we can perform t-SNE:
+
+```{r}
+set.seed(142)
+tSNE_ms_fit <- ms_dat_mut %>%
+  select(where(is.numeric)) %>%
+  column_to_rownames("ID") %>%
+  scale() %>% 
+  Rtsne()
+```
+
+After performing t-SNE, we'll save the two t-SNE components of interest in a data frame in order to combine it with the our classifying factors:
+
+```{r}
+# Store 2 t-SNE components in data frame
+tSNE_ms_df <- tSNE_ms_fit$Y %>% 
+  as.data.frame() %>%
+  rename(tSNE1="V1",
+         tSNE2="V2") %>%
+  mutate(ID=row_number())
+
+# Cross reference it to our classifying factors using row number
+tSNE_ms_df <- tSNE_ms_df %>%
+  inner_join(ms_meta, by="ID")
+```
+
+Now let's plot the results above:
+
+```{r}
+tSNE_ms_df %>%
+  ggplot(aes(x = tSNE1, 
+             y = tSNE2,
+             color = status,
+             shape = gender))+
+  geom_point()+
+  theme(legend.position="bottom")
+```
+
+It is apparent that some insights can be taken from the graph above. However, it does coincide with the results of previous section. Status was less efficient in classification than by gender, what can be observed in the great overlap between the factors in the graph.
+What happens when we add the race factor to the mix?
+```{r}
+tSNE_ms_df %>%
+  ggplot(aes(x = tSNE1, 
+             y = tSNE2,
+             color = race,
+             shape = gender))+
+  geom_point()+
+  theme(legend.position="bottom")
+
+tSNE_ms_df %>%
+  ggplot(aes(x = tSNE1, 
+             y = tSNE2,
+             color = race,
+             shape = status))+
+  geom_point()+
+  theme(legend.position="bottom")
+```
+
+These results still cannot help us differentiate between the different factors. It can be a result of the many metabolites that were tested and what we've observed in the classification in previous sections that there was no one metabolite that stood-out in its effect. Moreover, the graph strengthen our previous conclusions that the research has a clear bias toward white ethnicity. The reduction showed as seen in the kmeans section, that the data is continuous and overlapping. Thus, we need to search for other algorithms for classification.
+
+
+### Support Vector Machine (SVM)
+
+In the previous classification sections we assumed that the data was discontinued, but what if it not so as the previous section indicated. An analysis that can help in these cases is the SVM classification algorithm, a supervised classification algorithm, where each data item is plotted as a point in n-dimensional number of features space with the value of each feature being the value of a coordinate. This is followed by finding the hyper-plane that best differentiates the two classes. By SVM's ability to perform a non-linear classification, we can understand the pattern of our data better.
+First step in SVM is randomizing the numeric data for creating the training and test sets:
+
+```{r}
+# Numerical data only
+ms_num_fac <- ms_dat %>% select(-record_id, -batch) 
+  
+# Randomizing the data frame by rows
+shuffled_ms <- ms_num_fac[sample(1:nrow(ms_num_fac)), ]
+```
+
+Now that the data is randomized, we can create our training and test sets:
+
+```{r}
+# Splitting the randomized data into train and test sets
+ms_svm_train <- shuffled_ms[1:477, ]
+ms_svm_test <- shuffled_ms[478:954, ]
+```
+
+Now can build the model, first for the status of health:
+
+```{r}
+# Creating and training the model
+
+ms_svm_classifier_stat <- ksvm(ms_svm_train$status ~ ., data = ms_svm_train, kernel = "vanilladot")
+
+ms_svm_classifier_stat
+```
+
+The model used 199 support vectors with a training error of 0(?). Is it the same in the test set?
+
+```{r}
+# apply model on test set
+ms_svm_predictions_stat <- predict(ms_svm_classifier_stat, ms_svm_test)
+head(ms_svm_predictions_stat)
+```
+
+To examine how well the MS classifier performed, let's compare the prediction of the health status to what really happens in the test set using the table() function:
+
+```{r}
+table(ms_svm_predictions_stat, ms_svm_test$status)
+```
+
+But this table is still quite wage. We can use a binary vector to calculate the percentage to get a clearer picture:
+
+```{r}
+# Calculate true/false values
+agreement <- ms_svm_predictions_stat == ms_svm_test$status
+# True/false performance percentage
+prop.table(table(agreement))
+```
+
+Meaning, our current SVM status model has a moderate ~71% success rate. Improving the model performance is necessary. A standard Gaussian Radial basis function (RBF) may help in that: 
+
+```{r}
+# Train svm model with RBF kernel function
+ms_svm_classifier_rbf_stat <- ksvm(ms_svm_train$status ~ ., data = ms_svm_train, kernel = "rbfdot")
+```
+
+We'll create the prediction with this kernel:
+
+```{r}
+# Predict on test set
+ms_svm_predictions_rbf_stat <- predict(ms_svm_classifier_rbf_stat, ms_svm_test)
+```
+
+In comparison to the predictions with the previous kernel:
+```{r}
+# calculate preformance
+agreement_rbf_stat <- ms_svm_predictions_rbf_stat == ms_svm_test$status
+prop.table(table(agreement_rbf_stat))
+```
+
+We can see no significant improvement as we saw in previous sections of classifier model of status of health. Maybe classifying by gender will show better results:
+
+```{r}
+# Creating and training the model
+
+ms_svm_classifier_gen <- ksvm(ms_svm_train$gender ~ ., data = ms_svm_train, kernel = "vanilladot")
+
+ms_svm_classifier_gen
+```
+
+The model used 178 support vectors with a training error of 0(?). The predictions in the test set is:
+
+```{r}
+# apply model on test set
+ms_svm_predictions_gen <- predict(ms_svm_classifier_gen, ms_svm_test)
+head(ms_svm_predictions_gen)
+```
+
+This MS classifier performed in comparison to the test set:
+
+```{r}
+table(ms_svm_predictions_gen, ms_svm_test$gender)
+```
+
+Or in percentages:
+
+```{r}
+# Calculate true/false values
+agreement <- ms_svm_predictions_gen == ms_svm_test$gender
+# True/false performance percentage
+prop.table(table(agreement))
+```
+
+The gender SVM status model yields a moderate ~75% success rate. Maybe a standard Gaussian Radial basis function (RBF) may help with that: 
+
+```{r}
+# Train svm model with RBF kernel function
+ms_svm_classifier_rbf_gen <- ksvm(ms_svm_train$gender ~ ., data = ms_svm_train, kernel = "rbfdot")
+```
+
+With the prediction of:
+
+```{r}
+# Predict on test set
+ms_svm_predictions_rbf_gen <- predict(ms_svm_classifier_rbf_gen, ms_svm_test)
+```
+
+In comparison to the predictions with the previous kernel:
+```{r}
+# calculate preformance
+agreement_rbf <- ms_svm_predictions_rbf_gen == ms_svm_test$gender
+prop.table(table(agreement_rbf))
+```
+
+In contrast to the previous SVM model, the classification of gender improved significantly with the rbf kernel, from 75% to 87%. Will SVM succeed where previous algorithms failed?
+
+```{r}
+# Creating and training the model
+ms_svm_classifier_race <- ksvm(ms_svm_train$race ~ ., data = ms_svm_train, kernel = "vanilladot")
+
+ms_svm_classifier_race
+```
+
+The model used 260 support vectors with a training error of 0(?) with the predictions of:
+
+```{r}
+# apply model on test set
+ms_svm_predictions_race <- predict(ms_svm_classifier_race, ms_svm_test)
+head(ms_svm_predictions_race)
+```
+
+It seemed the classification of race worked in this algorithm. Let's check it:
+
+```{r}
+table(ms_svm_predictions_race, ms_svm_test$race)
+```
+
+Or in percentages:
+
+```{r}
+# Calculate true/false values
+agreement <- ms_svm_predictions_race == ms_svm_test$race
+# True/false performance percentage
+prop.table(table(agreement))
+```
+
+The SVM race classification model was the first to overcome the bias in the data and predict with ~86% accuracy the race of MS vs. HC individuals. Maybe radial classification will perfect the accuracy (not over fitting!) due to the previous graph we observed in the previous section (??????????????).
+
+```{r}
+# Train svm model with RBF kernel function
+ms_svm_classifier_rbf_race <- ksvm(ms_svm_train$race ~ ., data = ms_svm_train, kernel = "rbfdot")
+```
+
+With the prediction of test set of:
+
+```{r}
+# Predict on test set
+ms_svm_predictions_rbf_race <- predict(ms_svm_classifier_rbf_race, ms_svm_test)
+```
+
+In comparison to the predictions with the previous kernel:
+```{r}
+# Calculate performance
+agreement_rbf <- ms_svm_predictions_rbf_race == ms_svm_test$race
+prop.table(table(agreement_rbf))
+```
+
+The classification of race didn't change when we changed the kernel (85-86%).
+To sum up this section, the SVM algorithm is more flexible than previous ones. It gave overall great predictions, and can overcome biases in the data set. However, the SVM is quite of a black box of an algorithm. The question is if other flexible algorithms can yield similar results and performances.
+ 
+## Conclusions
+
+In this assignment we've use 4 different classifier models: KNN, kmeans, random forest and SVM; and one dimension reduction algorithm: t-SNE on the data set of Fitzgerald et al. 2021 on the MS metabolom. We've tried to classify the data according to three main factors characterizing of the each of the individuals tested in the research: status of health, gender and race.
+The first, the health status factor, in many of the algorithms didn’t give a good classification. The best classification was in the random forest algorithm with 73% accuracy, that even that isn’t a good result result. This could be explained by the rational that classifying MS from a healthy population is still enough for a good classification even with the information of the metabolom. It can be assumed that the disease is complex enough from a healthy individual that the metabolom information is still not enough in order to distinguish a healthy individual from MS one. 
+In contrast, in most algorithms the gender factor had the best classifier models of the three. The best one and with the most robust algorithm was random forest of 91% accuracy. This can indicate that in contrast to identifying MS from the general population as observed in the status factor, identifying MS from a female population with the metabolom gives a big accuracy of detection. Even more so, one of the contributing factors for classification was the age which even can further assist doctors in diagnosing MS more easily.
+Finally, the race factor in most algorithms wasn’t classified because of how skewed it is toward the white ethnicity. Most algorithms couldn’t overpass the fact that out of four levels of race, 83% were of white ethnicity. Only SVM was able to surpass that and give an unbiased good classification of ~86%. For future experiments, if possible, the testing needs to be more balanced.
+In the most affecting metabolite area, the results were not conclusive. As Fitzgerald et al 2021 showed, we do see how the aromatic amino acids impact the classification of MS in the status of health as we see aromatic amino acids precursors there. However, from the basis of this report only, much more research is required to get a clearer picture on the connection of the metabolom to MS detection. For example, the best and the most valid classification model we had, random forest by gender, indicated on other amino acids and hormones not specifically associated with aromatic amino acids.
+In a broader perspective each algorithm had its own benefits and shortcomings. The first, the KNN model, was simplest to perform. However, its accuracy, sensitivity, specificity and the ability to predict false values (negative and positive) were the worst of the 4 algorithms. It was good for the start of the analysis, to get some sense what the data is, but it is good for this purpose only. To strengthen its results, at least one additional model is required to validate its findings.
+The second, Kmeans also was easy to perform and illustrated the data wonderfully. But at the same time, its accuracy and general estimates were quite wage. It gave three distinct groups in the complex data, but from the many numbers there was only a wage way to check the validity of the results. Like KNN, this can also be a starter for getting to know our data, but its results need to be complimented with at least one other classification model. 
+The third, random forest, was the most robust and stringent algorithms of the 4, maybe due to its categorical classification that is not dependent on the scatter of the data. Beyond the good classification it gave to the status of health and gender, it has enough methods of correction and improvement that other algorithms didn’t have. Moreover, through the different processes the model had estimates to understand the model's performance, which weren't in the other algorithms. However, because it's one of the most robust and stringent algorithm, it is sensitive to imbalances in the data. In our case the race factor is biased towards the white ethnicity, which resulted with the analysis not working on this factor. With that said, this can be a characteristic of many algorithms and not just random forest.
+In contrast to the random forest, the final algorithm, the SVM algorithm is much more flexible. It fits continuous data with an ability to adjust to the correlation within the data, such as linear correlation as well as radial. Hence, it is less sensitive to imbalanced data as the factor race is and was able to give a good classification. Even its accuracy was quite good in comparison to the other algorithms excluding the random forest. But still it didn't give the best classification outcome of all algorithms. Even more so, the algorithm is quite of a black box without any estimates to review and check the validity of the model in the process.
+The dimension reduction method we've used was t-SNE in order to have an additional to the PCA used in the paper. The t-SNE indded reduced much of the clutter observed in the kmeans section. Despite that the results couldn't help in differentiation between the different factors. It can be a result of the many metabolites that were tested, or that the method used in Fitzgerald et al. 2021 PCA was more suited to the data than t-SNE. Otherwise, if the result of the method is used afterwards in an additional classification model, it can yield better classification models.
+In conclusion, further research is required to comprehend the differences between this report and the extensive research of Fitzgerald et al. 2021. 
+
+## Refrences 
+
+Fitzgerald KC, Smith MD, Kim S, Sotirchos ES, Kornberg MD, Douglas M, Nourbakhsh B, Graves J, Rattan R, Poisson L, Cerghet M, Mowry EM, Waubant E, Giri S, Calabresi PA, Bhargava P. Multi-omic evaluation of metabolic alterations in multiple sclerosis identifies shifts in aromatic amino acid metabolism. Cell Rep Med. 2021 Oct 19;2(10):100424. doi: 10.1016/j.xcrm.2021.100424. PMID: 34755135; PMCID: PMC8561319.
+
+Levi I, Gurevich M, Perlman G, Magalashvili D, Menascu S, Bar N, Godneva A, Zahavi L, Chermon D, Kosower N, Wolf BC, Malka G, Lotan-Pompan M, Weinberger A, Yirmiya E, Rothschild D, Leviatan S, Tsur A, Didkin M, Dreyer S, Eizikovitz H, Titngi Y, Mayost S, Sonis P, Dolev M, Stern Y, Achiron A, Segal E. Potential role of indolelactate and butyrate in multiple sclerosis revealed by integrated microbiome-metabolome analysis. Cell Rep Med. 2021 Apr 20;2(4):100246. doi: 10.1016/j.xcrm.2021.100246. PMID: 33948576; PMCID: PMC8080254.
+
